@@ -1,18 +1,23 @@
 name: Duel League Cron
+
 on:
   schedule:
-    - cron: '*/30 * * * *'  # كل 30 دقيقة
-  workflow_dispatch:  # تشتغل يدوي
+    - cron: '*/30 * * * *'   # كل 30 دقيقة
+  workflow_dispatch:          # تشغيل يدوي
+
+# ما نسمح بتشغيلين بنفس الوقت (يمنع تكرار المكافآت)
+concurrency:
+  group: duel-league
+  cancel-in-progress: false
 
 jobs:
   duel-cron:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: '18'
-      
+          node-version: '20'
+
       - name: Install & Run
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
@@ -20,228 +25,196 @@ jobs:
         run: |
           npm install firebase-admin
           node << 'EOFSCRIPT'
-          
           const admin = require("firebase-admin");
-          const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+
+          // ── الإعدادات ──────────────────────────────────────────
+          const DAY = 24 * 3600 * 1000;
+          const CYCLE_MS = DAY;                   // مدة دوري 1v1: 24 ساعة
+          const PAUSE_MS = 6 * DAY;               // الاستراحة: 6 أيام
+          const DUEL_WIN_PTS = 25;
+          const DUEL_DRAW_PTS = 13;
+          const FIRST_PLACE_BONUS = 250;          // مكافأة المركز الأول بنهاية الدوري
+          const TZ_OFFSET_MS = 3 * 3600 * 1000;   // توقيت بغداد (UTC+3)
+          const ACTIVE_DAYS = 7;                  // نزوّج بس اللي فتح اللعبة خلال آخر 7 أيام
+
+          // ── تهيئة Firebase (مع رسالة واضحة لو السر غلط) ──────────
+          let serviceAccount;
+          try {
+            serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || "");
+          } catch (e) {
+            console.error('FIREBASE_SERVICE_ACCOUNT ليس JSON صحيح. الصق محتوى ملف مفتاح حساب الخدمة كامل (يبدأ بـ {"type": "service_account").');
+            process.exit(1);
+          }
+          if (!serviceAccount.private_key || !process.env.FIREBASE_DB_URL) {
+            console.error("ناقص: مفتاح حساب الخدمة أو FIREBASE_DB_URL");
+            process.exit(1);
+          }
           admin.initializeApp({
             credential: admin.credential.cert(serviceAccount),
             databaseURL: process.env.FIREBASE_DB_URL
           });
           const db = admin.database();
-          
-          const CYCLE_MS = 24 * 3600 * 1000;
-          const PAUSE_MS = 6 * 24 * 3600 * 1000;
-          const DUEL_WIN_PTS = 25;
-          const DUEL_DRAW_PTS = 13;
-          
-          function mostRecentSaturdayMidnight() {
-            const d = new Date();
-            const day = d.getDay();
-            const diffToSat = (day - 6 + 7) % 7;
-            const sat = new Date(d.getFullYear(), d.getMonth(), d.getDate() - diffToSat, 0, 0, 0, 0);
-            return sat.getTime();
+          const inc = (n) => admin.database.ServerValue.increment(n);
+
+          // ── أدوات الوقت ────────────────────────────────────────
+          // آخر سبت الساعة 00:00 بتوقيت بغداد (بالمللي ثانية UTC)
+          function lastSaturdayMidnight(nowMs) {
+            const d = new Date(nowMs + TZ_OFFSET_MS);
+            const diff = (d.getUTCDay() - 6 + 7) % 7;
+            return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - diff) - TZ_OFFSET_MS;
           }
-          
-          async function pairPlayersForDuel() {
-            const playersSnap = await db.ref("players").once("value");
-            const players = [];
-            
-            playersSnap.forEach(snap => {
-              players.push({ uid: snap.key, ...snap.val() });
+          // بداية الدورة: السبت الحالي إذا لسا داخل نافذة الـ24 ساعة، وإلا السبت الجاي
+          function pickStart(nowMs) {
+            const s = lastSaturdayMidnight(nowMs);
+            return nowMs < s + CYCLE_MS ? s : s + 7 * DAY;
+          }
+          // streakData.lastDate يكون بصيغة "2026-9-20"
+          function isActive(p, nowMs) {
+            const ld = p.streakData && p.streakData.lastDate;
+            if (!ld) return false;
+            const [y, m, d] = String(ld).split("-").map(Number);
+            const t = Date.UTC(y, m - 1, d);
+            return !isNaN(t) && nowMs - t <= (ACTIVE_DAYS + 1) * DAY;
+          }
+
+          // ── 1) توزيع الخصوم (مرة وحدة لكل دورة) ─────────────────
+          async function pairPlayers(nowMs) {
+            const snap = await db.ref("players").once("value");
+            const all = [];
+            snap.forEach((s) => {
+              const v = s.val() || {};
+              all.push({ uid: s.key, name: v.name, photo: v.photo, hasOpp: !!v.duelOpp, active: isActive(v, nowMs) });
             });
-            
-            if (players.length < 2) {
-              console.log("Not enough players to pair");
-              return;
-            }
-            
-            for (let i = players.length - 1; i > 0; i--) {
+            let pool = all.filter((p) => p.name && p.active);
+            if (pool.length < 2) pool = all.filter((p) => p.name);   // لو ما فيه نشيطين كفاية نزوّج الكل
+            for (let i = pool.length - 1; i > 0; i--) {
               const j = Math.floor(Math.random() * (i + 1));
-              [players[i], players[j]] = [players[j], players[i]];
+              [pool[i], pool[j]] = [pool[j], pool[i]];
             }
-            
             const updates = {};
-            for (let i = 0; i < players.length - 1; i += 2) {
-              const p1 = players[i];
-              const p2 = players[i + 1];
-              
-              updates[`players/${p1.uid}/duelOpp`] = { id: p2.uid, name: p2.name || "لاعب", photo: p2.photo || "" };
-              updates[`players/${p2.uid}/duelOpp`] = { id: p1.uid, name: p1.name || "لاعب", photo: p1.photo || "" };
-              updates[`players/${p1.uid}/duelSeasonPoints`] = 0;
-              updates[`players/${p2.uid}/duelSeasonPoints`] = 0;
+            const paired = new Set();
+            for (let i = 0; i + 1 < pool.length; i += 2) {
+              const a = pool[i], b = pool[i + 1];
+              updates[`players/${a.uid}/duelOpp`] = { id: b.uid, name: b.name || "لاعب", photo: b.photo || "" };
+              updates[`players/${b.uid}/duelOpp`] = { id: a.uid, name: a.name || "لاعب", photo: a.photo || "" };
+              paired.add(a.uid); paired.add(b.uid);
             }
-            
-            if (players.length % 2 === 1) {
-              const odd = players[players.length - 1];
-              updates[`players/${odd.uid}/duelOpp`] = null;
-              updates[`players/${odd.uid}/duelSeasonPoints`] = 0;
-            }
-            
-            await db.ref().update(updates);
-          }
-          
-          async function awardDuelMatchRewards() {
-            const roomsSnap = await db.ref("rooms").once("value");
-            const updates = {};
-            let matchCount = 0;
-            
-            roomsSnap.forEach(snap => {
-              const room = snap.val();
-              const roomId = snap.key;
-              
-              if (!room.winner || room.duelRewarded || roomId.startsWith("friend_")) return;
-              
-              const [winnerColor, reason] = room.winner.split("_");
-              const whiteUid = room.white?.uid;
-              const blackUid = room.black?.uid;
-              
-              if (!whiteUid || !blackUid) return;
-              
-              const winnerUid = winnerColor === "white" ? whiteUid : blackUid;
-              const loserUid = winnerColor === "white" ? blackUid : whiteUid;
-              const piecesEaten = (winnerColor === "white" ? (16 - room.black?.pieces) : (16 - room.white?.pieces)) || 0;
-              
-              let winnerPts = DUEL_WIN_PTS;
-              let loserPts = 0;
-              
-              if (reason === "draw") {
-                winnerPts = DUEL_DRAW_PTS;
-                loserPts = DUEL_DRAW_PTS;
-              }
-              
-              updates[`players/${winnerUid}/duelSeasonPoints`] = admin.database.ServerValue.increment(winnerPts);
-              updates[`players/${winnerUid}/duelSeasonWins`] = admin.database.ServerValue.increment(1);
-              
-              if (loserPts > 0) {
-                updates[`players/${loserUid}/duelSeasonPoints`] = admin.database.ServerValue.increment(loserPts);
-              }
-              
-              const matchId = `${roomId}_${Date.now()}`;
-              updates[`duelMatches/${winnerUid}/${matchId}`] = {
-                ts: Date.now(),
-                oppUid: loserUid,
-                result: reason === "draw" ? "draw" : "win",
-                pieces: piecesEaten
-              };
-              updates[`duelMatches/${loserUid}/${matchId}`] = {
-                ts: Date.now(),
-                oppUid: winnerUid,
-                result: reason === "draw" ? "draw" : "loss",
-                pieces: 16 - piecesEaten
-              };
-              
-              updates[`rooms/${roomId}/duelRewarded`] = true;
-              matchCount++;
+            // نصفّر نقاط الدورة وسجل المواجهات للمزوّجين، ونمسح الخصم القديم لغيرهم
+            paired.forEach((uid) => {
+              updates[`players/${uid}/duelSeasonPoints`] = 0;
+              updates[`players/${uid}/duelSeasonWins`] = 0;
+              updates[`duelMatches/${uid}`] = null;
             });
-            
-            if (Object.keys(updates).length > 0) {
-              await db.ref().update(updates);
-              console.log(`Rewarded ${matchCount} duel matches`);
-            }
+            all.forEach((p) => {
+              if (!paired.has(p.uid) && p.hasOpp) updates[`players/${p.uid}/duelOpp`] = null;
+            });
+            if (Object.keys(updates).length) await db.ref().update(updates);
+            console.log(`Paired ${paired.size / 2} duels`);
           }
-          
-          async function finalizeDuelCycleRewards() {
+
+          // ── 2) نقاط المباريات (بس بين الخصمين المرتبطين وداخل الدورة) ──
+          async function awardMatches(cycleStart, cycleEnd, nowMs) {
+            const roomsSnap = await db.ref("rooms").orderByChild("created").startAt(cycleStart).once("value");
+            const candidates = [];
+            roomsSnap.forEach((s) => {
+              const r = s.val() || {};
+              const id = s.key;
+              if (id.startsWith("friend_") || r.duelRewarded || typeof r.winner !== "string") return;
+              if (!r.created || r.created > cycleEnd) return;
+              const w = r.white && r.white.uid, b = r.black && r.black.uid;
+              if (!w || !b || w === b) return;
+              candidates.push({ id, r, w, b });
+            });
+            if (!candidates.length) { console.log("No finished rooms to check"); return; }
+
             const playersSnap = await db.ref("players").once("value");
+            const oppOf = {};
+            playersSnap.forEach((s) => { const o = (s.val() || {}).duelOpp; oppOf[s.key] = o && o.id; });
+
+            const addPts = {}, addWins = {}, updates = {};
+            let count = 0;
+            for (const { id, r, w, b } of candidates) {
+              if (oppOf[w] !== b || oppOf[b] !== w) continue;          // مو خصمين بمواجهة 1v1
+              const side = String(r.winner).split("_")[0];             // white / black / draw
+              if (side !== "white" && side !== "black" && side !== "draw") continue;
+              const wCap = Number(r.whiteCaptures) || 0, bCap = Number(r.blackCaptures) || 0;
+              let wRes, bRes;
+              if (side === "draw") {
+                wRes = bRes = "draw";
+                addPts[w] = (addPts[w] || 0) + DUEL_DRAW_PTS;
+                addPts[b] = (addPts[b] || 0) + DUEL_DRAW_PTS;
+              } else {
+                const win = side === "white" ? w : b;
+                wRes = side === "white" ? "win" : "loss";
+                bRes = side === "black" ? "win" : "loss";
+                addPts[win] = (addPts[win] || 0) + DUEL_WIN_PTS;
+                addWins[win] = (addWins[win] || 0) + 1;
+              }
+              updates[`duelMatches/${w}/${id}`] = { ts: nowMs, oppUid: b, result: wRes, pieces: wCap };
+              updates[`duelMatches/${b}/${id}`] = { ts: nowMs, oppUid: w, result: bRes, pieces: bCap };
+              updates[`rooms/${id}/duelRewarded`] = true;
+              count++;
+            }
+            Object.keys(addPts).forEach((u) => { updates[`players/${u}/duelSeasonPoints`] = inc(addPts[u]); });
+            Object.keys(addWins).forEach((u) => { updates[`players/${u}/duelSeasonWins`] = inc(addWins[u]); });
+            if (count) {
+              await db.ref().update(updates);
+              console.log(`Rewarded ${count} duel matches`);
+            }
+          }
+
+          // ── 3) نهاية الدورة: مكافأة الأول + عدّاد المراكز + بدء الاستراحة (بكتابة وحدة) ──
+          async function finalizeCycle(nowMs) {
+            const snap = await db.ref("players").once("value");
             const list = [];
-            
-            playersSnap.forEach(snap => {
-              list.push({
-                uid: snap.key,
-                pts: snap.val().duelSeasonPoints || 0,
-                curPts: snap.val().points || 0,
-                curMax: snap.val().maxPoints || 0
-              });
+            snap.forEach((s) => {
+              const v = s.val() || {};
+              list.push({ uid: s.key, pts: v.duelSeasonPoints || 0, wins: v.duelSeasonWins || 0, cur: v.points || 0, max: v.maxPoints || 0 });
             });
-            
-            list.sort((a, b) => b.pts - a.pts);
-            
+            list.sort((a, b) => b.pts - a.pts || b.wins - a.wins || (a.uid < b.uid ? -1 : 1));
             const updates = {};
             const rankFields = ["rank1", "rank2", "rank3"];
-            
-            list.forEach((player, idx) => {
-              if (player.pts <= 0) return;
-              
-              const rank = idx + 1;
-              let bonus = 0;
-              
-              if (rank === 1) bonus = 250;
-              
-              if (bonus > 0) {
-                updates[`players/${player.uid}/points`] = admin.database.ServerValue.increment(bonus);
-                updates[`players/${player.uid}/maxPoints`] = Math.max(player.curMax, player.curPts + bonus);
-              }
-              
-              if (rank <= 3) {
-                updates[`players/${player.uid}/${rankFields[rank - 1]}`] = admin.database.ServerValue.increment(1);
+            list.forEach((p, i) => {
+              if (p.pts <= 0 || i > 2) return;
+              updates[`players/${p.uid}/${rankFields[i]}`] = inc(1);
+              if (i === 0) {
+                updates[`players/${p.uid}/points`] = inc(FIRST_PLACE_BONUS);
+                updates[`players/${p.uid}/maxPoints`] = Math.max(p.max, p.cur + FIRST_PLACE_BONUS);
               }
             });
-            
-            playersSnap.forEach(snap => {
-              updates[`players/${snap.key}/duelSeasonPoints`] = 0;
-            });
-            
+            updates["duelCycle/waitStart"] = nowMs;   // بنفس الكتابة عشان ما تتكرر المكافأة لو انقطع التشغيل
             await db.ref().update(updates);
-            console.log("Duel cycle rewards finalized");
+            console.log("Cycle finalized, pause started");
           }
-          
-          async function runDuelCron() {
+
+          // ── المشغّل الرئيسي ────────────────────────────────────
+          async function main() {
             const now = Date.now();
-            
-            try {
-              const cycleRef = db.ref("duelCycle");
-              const cycleSnap = await cycleRef.once("value");
-              let cycleData = cycleSnap.val() || {};
-              
-              if (!cycleData.start) {
-                cycleData.start = mostRecentSaturdayMidnight();
-                cycleData.waitStart = null;
-                await cycleRef.set(cycleData);
-                console.log("Initialized duel cycle:", new Date(cycleData.start).toISOString());
-              }
-              
-              const cycleStart = cycleData.start;
-              const cycleEnd = cycleStart + CYCLE_MS;
-              const waitStart = cycleData.waitStart;
-              
-              if (waitStart && now < waitStart + PAUSE_MS) {
-                console.log("Duel cycle in pause phase");
-                return;
-              }
-              
-              if (waitStart && now >= waitStart + PAUSE_MS) {
-                cycleData.start = mostRecentSaturdayMidnight();
-                cycleData.waitStart = null;
-                await cycleRef.set(cycleData);
-                console.log("Starting new duel cycle");
-              }
-              
-              const cycleAge = now - cycleStart;
-              if (cycleAge >= 0 && cycleAge < 30 * 60 * 1000) {
-                await pairPlayersForDuel();
-                console.log("✓ Players paired");
-              }
-              
-              await awardDuelMatchRewards();
-              console.log("✓ Match rewards processed");
-              
-              if (now >= cycleEnd && !waitStart) {
-                await finalizeDuelCycleRewards();
-                await cycleRef.update({ waitStart: now });
-                console.log("✓ Cycle ended, pause started");
-              }
-              
-            } catch (error) {
-              console.error("Error:", error);
-              process.exit(1);
+            const cycleRef = db.ref("duelCycle");
+            let c = (await cycleRef.once("value")).val() || {};
+
+            if (!c.start) {
+              c = { start: pickStart(now), waitStart: null, pairedStart: null };
+              await cycleRef.set(c);
+              console.log("Initialized duel cycle:", new Date(c.start).toISOString());
             }
+            if (c.waitStart && now >= c.waitStart + PAUSE_MS) {
+              c = { start: pickStart(now), waitStart: null, pairedStart: null };
+              await cycleRef.set(c);
+              console.log("New duel cycle:", new Date(c.start).toISOString());
+            }
+            if (c.waitStart) { console.log("Pause phase"); return; }
+            if (now < c.start) { console.log("Cycle has not started yet"); return; }
+
+            const cycleEnd = c.start + CYCLE_MS;
+            if (c.pairedStart !== c.start) {
+              await pairPlayers(now);
+              await cycleRef.update({ pairedStart: c.start });
+            }
+            await awardMatches(c.start, cycleEnd, now);
+            if (now >= cycleEnd) await finalizeCycle(now);
           }
-          
-          runDuelCron().then(() => {
-            console.log("✓ Duel cron done");
-            process.exit(0);
-          }).catch(err => {
-            console.error("Failed:", err);
-            process.exit(1);
-          });
-          
+
+          main().then(() => { console.log("Done"); process.exit(0); })
+                .catch((err) => { console.error("Failed:", err && err.message ? err.message : err); process.exit(1); });
           EOFSCRIPT
