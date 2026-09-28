@@ -31,9 +31,8 @@ jobs:
           const DAY = 24 * 3600 * 1000;
           const CYCLE_MS = DAY;                   // مدة دوري 1v1: 24 ساعة
           const PAUSE_MS = 6 * DAY;               // الاستراحة: 6 أيام
-          const DUEL_WIN_PTS = 25;
-          const DUEL_DRAW_PTS = 13;
-          const FIRST_PLACE_BONUS = 250;          // مكافأة المركز الأول بنهاية الدوري
+          const FIRST_PLACE_BONUS = 100;          // مكافأة الفائز بالدوري (الأكثر أكلاً بنهاية الـ24 ساعة)، والخاسر 0
+          const GRACE_MS = 30 * 60 * 1000;        // مهلة بعد نهاية الدورة لتنتهي المباريات الجارية
           const TZ_OFFSET_MS = 3 * 3600 * 1000;   // توقيت بغداد (UTC+3)
           const ACTIVE_DAYS = 7;                  // نزوّج بس اللي فتح اللعبة خلال آخر 7 أيام
 
@@ -112,7 +111,7 @@ jobs:
             console.log(`Paired ${paired.size / 2} duels`);
           }
 
-          // ── 2) نقاط المباريات (بس بين الخصمين المرتبطين وداخل الدورة) ──
+          // ── 2) النقاط = عدد القطع المأكولة (كل لاعب بمبارياته الأونلاين، مو ضد خصمه) ──
           async function awardMatches(cycleStart, cycleEnd, nowMs) {
             const roomsSnap = await db.ref("rooms").orderByChild("created").startAt(cycleStart).once("value");
             const candidates = [];
@@ -121,45 +120,41 @@ jobs:
               const id = s.key;
               if (id.startsWith("friend_") || r.duelRewarded || typeof r.winner !== "string") return;
               if (!r.created || r.created > cycleEnd) return;
-              const w = r.white && r.white.uid, b = r.black && r.black.uid;
+              const w = r.whiteUid || (r.white && r.white.uid), b = r.blackUid || (r.black && r.black.uid);
               if (!w || !b || w === b) return;
               candidates.push({ id, r, w, b });
             });
             if (!candidates.length) { console.log("No finished rooms to check"); return; }
 
+            // نحسب بس للاعبين اللي عندهم خصم دوري هذا الأسبوع
             const playersSnap = await db.ref("players").once("value");
-            const oppOf = {};
-            playersSnap.forEach((s) => { const o = (s.val() || {}).duelOpp; oppOf[s.key] = o && o.id; });
+            const inDuel = {};
+            playersSnap.forEach((s) => { const o = (s.val() || {}).duelOpp; inDuel[s.key] = !!(o && o.id); });
 
-            const addPts = {}, addWins = {}, updates = {};
+            const addPts = {}, updates = {};
             let count = 0;
             for (const { id, r, w, b } of candidates) {
-              if (oppOf[w] !== b || oppOf[b] !== w) continue;          // مو خصمين بمواجهة 1v1
               const side = String(r.winner).split("_")[0];             // white / black / draw
               if (side !== "white" && side !== "black" && side !== "draw") continue;
               const wCap = Number(r.whiteCaptures) || 0, bCap = Number(r.blackCaptures) || 0;
-              let wRes, bRes;
-              if (side === "draw") {
-                wRes = bRes = "draw";
-                addPts[w] = (addPts[w] || 0) + DUEL_DRAW_PTS;
-                addPts[b] = (addPts[b] || 0) + DUEL_DRAW_PTS;
-              } else {
-                const win = side === "white" ? w : b;
-                wRes = side === "white" ? "win" : "loss";
-                bRes = side === "black" ? "win" : "loss";
-                addPts[win] = (addPts[win] || 0) + DUEL_WIN_PTS;
-                addWins[win] = (addWins[win] || 0) + 1;
+              const wRes = side === "draw" ? "draw" : (side === "white" ? "win" : "loss");
+              const bRes = side === "draw" ? "draw" : (side === "black" ? "win" : "loss");
+              // الفوز/الخسارة/الانسحاب ما يأثر: المهم عدد الأكلات فقط
+              if (inDuel[w]) {
+                addPts[w] = (addPts[w] || 0) + wCap;
+                updates[`duelMatches/${w}/${id}`] = { ts: nowMs, oppUid: b, result: wRes, pieces: wCap };
               }
-              updates[`duelMatches/${w}/${id}`] = { ts: nowMs, oppUid: b, result: wRes, pieces: wCap };
-              updates[`duelMatches/${b}/${id}`] = { ts: nowMs, oppUid: w, result: bRes, pieces: bCap };
+              if (inDuel[b]) {
+                addPts[b] = (addPts[b] || 0) + bCap;
+                updates[`duelMatches/${b}/${id}`] = { ts: nowMs, oppUid: w, result: bRes, pieces: bCap };
+              }
               updates[`rooms/${id}/duelRewarded`] = true;
               count++;
             }
             Object.keys(addPts).forEach((u) => { updates[`players/${u}/duelSeasonPoints`] = inc(addPts[u]); });
-            Object.keys(addWins).forEach((u) => { updates[`players/${u}/duelSeasonWins`] = inc(addWins[u]); });
             if (count) {
               await db.ref().update(updates);
-              console.log(`Rewarded ${count} duel matches`);
+              console.log(`Counted captures from ${count} matches`);
             }
           }
 
@@ -169,7 +164,7 @@ jobs:
             const list = [];
             snap.forEach((s) => {
               const v = s.val() || {};
-              list.push({ uid: s.key, pts: v.duelSeasonPoints || 0, wins: v.duelSeasonWins || 0, cur: v.points || 0, max: v.maxPoints || 0 });
+              list.push({ uid: s.key, opp: v.duelOpp && v.duelOpp.id, pts: v.duelSeasonPoints || 0, wins: v.duelSeasonWins || 0, cur: v.points || 0, max: v.maxPoints || 0 });
             });
             list.sort((a, b) => b.pts - a.pts || b.wins - a.wins || (a.uid < b.uid ? -1 : 1));
             const updates = {};
@@ -177,10 +172,20 @@ jobs:
             list.forEach((p, i) => {
               if (p.pts <= 0 || i > 2) return;
               updates[`players/${p.uid}/${rankFields[i]}`] = inc(1);
-              if (i === 0) {
-                updates[`players/${p.uid}/points`] = inc(FIRST_PLACE_BONUS);
-                updates[`players/${p.uid}/maxPoints`] = Math.max(p.max, p.cur + FIRST_PLACE_BONUS);
-              }
+            });
+            // مكافأة الفائز بدوري كل زوج: الأكثر أكلاً للقطع. الخاسر 0، والتعادل أو صفر أكلات = لا أحد
+            const byUid = {};
+            list.forEach((p) => { byUid[p.uid] = p; });
+            const seen = new Set();
+            list.forEach((p) => {
+              const o = p.opp && byUid[p.opp];
+              if (!o || seen.has(p.uid)) return;
+              seen.add(p.uid); seen.add(o.uid);
+              if (p.pts <= 0 && o.pts <= 0) return;
+              if (p.pts === o.pts) return;                 // تعادل بالأكلات = ما أحد ياخذ المكافأة
+              const top = p.pts > o.pts ? p : o;
+              updates[`players/${top.uid}/points`] = inc(FIRST_PLACE_BONUS);
+              updates[`players/${top.uid}/maxPoints`] = Math.max(top.max, top.cur + FIRST_PLACE_BONUS);
             });
             updates["duelCycle/waitStart"] = nowMs;   // بنفس الكتابة عشان ما تتكرر المكافأة لو انقطع التشغيل
             await db.ref().update(updates);
@@ -212,7 +217,7 @@ jobs:
               await cycleRef.update({ pairedStart: c.start });
             }
             await awardMatches(c.start, cycleEnd, now);
-            if (now >= cycleEnd) await finalizeCycle(now);
+            if (now >= cycleEnd + GRACE_MS) await finalizeCycle(now);
           }
 
           main().then(() => { console.log("Done"); process.exit(0); })
