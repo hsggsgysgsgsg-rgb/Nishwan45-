@@ -1,4 +1,4 @@
-name: Duel League Cron
+:name: Duel League Cron
 
 on:
   schedule:
@@ -223,3 +223,4 @@ jobs:
           main().then(() => { console.log("Done"); process.exit(0); })
                 .catch((err) => { console.error("Failed:", err && err.message ? err.message : err); process.exit(1); });
           EOFSCRIPT
+  
