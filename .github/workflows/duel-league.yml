@@ -1,4 +1,4 @@
-:name: Duel League Cron
+name: Duel League Cron
 
 on:
   schedule:
